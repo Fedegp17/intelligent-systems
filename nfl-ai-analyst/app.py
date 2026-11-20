@@ -5,6 +5,8 @@ streamlit run app.py
 
 from __future__ import annotations
 
+import altair as alt
+import pandas as pd
 import polars as pl
 import streamlit as st
 from dotenv import load_dotenv
@@ -27,6 +29,65 @@ def games_df() -> pl.DataFrame:
 @st.cache_data(ttl=6 * 3600)
 def injuries_df() -> pl.DataFrame:
     return load_injuries()
+
+
+def win_probability_chart(week_reports: list[analysis.GameReport]) -> alt.Chart:
+    """One bar per game: away team share on the left, home team share on the right."""
+    rows = []
+    for r in week_reports:
+        p = r.prediction
+        label = f"{p.away_team} @ {p.home_team}"
+        rows.append(
+            {
+                "game": label,
+                "team": p.away_team,
+                "side": "Visitante",
+                "prob": p.away_win_prob,
+                "start": 0.0,
+                "end": p.away_win_prob,
+            }
+        )
+        rows.append(
+            {
+                "game": label,
+                "team": p.home_team,
+                "side": "Local",
+                "prob": p.home_win_prob,
+                "start": p.away_win_prob,
+                "end": 1.0,
+            }
+        )
+    data = pd.DataFrame(rows)
+    order = [f"{r.prediction.away_team} @ {r.prediction.home_team}" for r in week_reports]
+    y = alt.Y("game:N", sort=order, title=None)
+    bars = (
+        alt.Chart(data)
+        .mark_bar()
+        .encode(
+            x=alt.X(
+                "start:Q", axis=alt.Axis(format="%"), title=None, scale=alt.Scale(domain=[0, 1])
+            ),
+            x2="end:Q",
+            y=y,
+            color=alt.Color(
+                "side:N",
+                scale=alt.Scale(domain=["Visitante", "Local"], range=["#9aa5b1", "#1f6feb"]),
+                title=None,
+            ),
+            tooltip=["game", "team", alt.Tooltip("prob:Q", format=".1%")],
+        )
+    )
+    labels = (
+        alt.Chart(data)
+        .mark_text(color="white", fontWeight="bold")
+        .encode(x=alt.X("mid:Q"), y=y, text="label:N")
+        .transform_calculate(
+            mid="(datum.start + datum.end) / 2",
+            label="datum.team + ' ' + format(datum.prob, '.0%')",
+        )
+    )
+    rule = alt.Chart(pd.DataFrame({"x": [0.5]})).mark_rule(strokeDash=[4, 4]).encode(x="x:Q")
+    return (bars + labels + rule).properties(height=32 * len(order))
 
 
 if st.sidebar.button("Recargar datos"):
@@ -109,7 +170,10 @@ with tab_week:
         st.info("No hay partidos pendientes esta temporada.")
     else:
         week = st.selectbox("Semana", weeks)
-        st.markdown(report.week_markdown(analysis.predict_week(week)))
+        week_reports = analysis.predict_week(week)
+        st.subheader("Probabilidad de ganar")
+        st.altair_chart(win_probability_chart(week_reports), use_container_width=True)
+        st.markdown(report.week_markdown(week_reports))
 
 with tab_game:
     pending = games.filter((pl.col("season") == season) & pl.col("home_score").is_null())
