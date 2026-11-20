@@ -115,3 +115,77 @@ def test_parse_rss_sorts_newest_first():
     items = parse_rss(xml, "KC")
     assert [h.title for h in items] == ["New", "Old"]
     assert items[0].source == "NFL.com"
+
+
+def test_missing_stars_lower_the_team_margin():
+    from nfl_analyst.availability import Star, TeamAvailability
+
+    game = {
+        "game_id": "g",
+        "season": 2024,
+        "week": 1,
+        "home_team": "KC",
+        "away_team": "BAL",
+        "location": "Neutral",
+    }
+    kc = TeamAvailability(
+        "KC",
+        [
+            Star("1", "QB uno", "QB", "QB", 300, absent=True, reason="Reporte: Out"),
+            Star("2", "WR uno", "WR", "OFF", 150),
+            Star("3", "DE uno", "DE", "DEF", 20, absent=True, reason="Lista de lesionados (IR)"),
+        ],
+    )
+    p = model.Ratings().predict(game, {"KC": kc, "BAL": TeamAvailability("BAL")})
+    assert p.home_absence_penalty == pytest.approx(model.QB_OUT_PENALTY + model.DEF_STAR_PENALTY)
+    assert p.margin == pytest.approx(-p.home_absence_penalty)
+    assert p.away_win_prob > 0.5
+
+
+def test_stars_come_only_from_previous_games():
+    from nfl_analyst import availability as av
+
+    def row(game_id, pid, group, **stats):
+        base = {"player_id": pid, "name": pid, "position": group, "position_group": group}
+        return {
+            "game_id": game_id,
+            "team": "KC",
+            "dropbacks": 0,
+            "ppr": 0,
+            "impact": 0,
+            "epa": 0,
+            **base,
+            **stats,
+        }
+
+    games = pl.DataFrame(
+        [
+            {
+                "game_id": "a",
+                "season": 2024,
+                "week": 1,
+                "home_team": "KC",
+                "away_team": "BAL",
+                "home_score": 20,
+                "away_score": 10,
+            },
+            {
+                "game_id": "b",
+                "season": 2024,
+                "week": 2,
+                "home_team": "KC",
+                "away_team": "BAL",
+                "home_score": None,
+                "away_score": None,
+            },
+        ]
+    )
+    players = pl.DataFrame(
+        [row("a", "qb1", "QB", dropbacks=35, epa=5), row("a", "wr1", "WR", ppr=25)]
+    )
+    report = {(2024, 2, "KC"): {"qb1": "Out"}}
+    result = av.availability_by_game(games, players, report, {})
+    assert result["a"]["KC"].stars == []  # nothing known before the first game
+    kc = result["b"]["KC"]
+    assert [s.name for s in kc.stars] == ["qb1", "wr1"]
+    assert kc.qb_out and not kc.missing("OFF")

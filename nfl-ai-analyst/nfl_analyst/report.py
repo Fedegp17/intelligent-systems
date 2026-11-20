@@ -12,6 +12,45 @@ def _spread(team: str, margin: float) -> str:
     return "Pick'em" if rounded == 0 else f"{team} -{rounded:g}"
 
 
+ROLE_LABEL = {"QB": "QB titular", "OFF": "Estrella ofensiva", "DEF": "Estrella defensiva"}
+
+
+def _missing_short(p, team: str) -> str:
+    if not p.availability or team not in p.availability:
+        return ""
+    names = [f"{s.name} ({s.position})" for s in p.availability[team].stars if s.absent]
+    return f"{team}: " + ", ".join(names) if names else ""
+
+
+def stars_markdown(p) -> list[str]:
+    if not p.availability:
+        return []
+    lines = [
+        "",
+        "### Estrellas y bajas",
+        "| Equipo | Rol | Jugador | Pos | Disponible |",
+        "|---|---|---|---|---|",
+    ]
+    for team in (p.away_team, p.home_team):
+        for s in p.availability[team].stars if team in p.availability else []:
+            status = f"No ({s.reason})" if s.absent else "Sí"
+            lines.append(f"| {team} | {ROLE_LABEL[s.role]} | {s.name} | {s.position} | {status} |")
+    penalties = [
+        f"{team} −{pen:.1f} pts"
+        for team, pen in (
+            (p.away_team, p.away_absence_penalty),
+            (p.home_team, p.home_absence_penalty),
+        )
+        if pen
+    ]
+    lines.append(
+        "- **Ajuste por bajas:** "
+        + (", ".join(penalties) if penalties else "ninguno")
+        + " (QB 2.0, estrella ofensiva 1.1, defensiva 0.6 por jugador)"
+    )
+    return lines
+
+
 def game_markdown(report: GameReport) -> str:
     p = report.prediction
     favorite = p.home_team if p.margin >= 0 else p.away_team
@@ -28,10 +67,12 @@ def game_markdown(report: GameReport) -> str:
         "",
         (
             f"- **Margen proyectado:** {_spread(favorite, p.margin)} "
-            f"(Elo {p.elo_margin:+.1f}, modelo de puntos {p.points_margin:+.1f}, positivo = local)"
+            f"(Elo {p.elo_margin:+.1f}, modelo de puntos {p.points_margin:+.1f}, "
+            f"bajas {p.away_absence_penalty - p.home_absence_penalty:+.1f}; positivo = local)"
         ),
         f"- **Total proyectado:** {p.total:.1f} puntos",
     ]
+    lines += stars_markdown(p)
     if report.injuries is not None:
         lines += ["", "### Reporte oficial de lesiones"]
         if report.injuries.is_empty():
@@ -65,8 +106,8 @@ def week_markdown(reports: list[GameReport]) -> str:
     lines = [
         f"## Semana {reports[0].prediction.week}",
         "",
-        "| Partido | Fecha | Favorito | Prob. | Margen | Total |",
-        "|---|---|---|---|---|---|",
+        "| Partido | Fecha | Favorito | Prob. | Margen | Total | Bajas de estrellas |",
+        "|---|---|---|---|---|---|---|",
     ]
     for r in reports:
         p = r.prediction
@@ -74,7 +115,11 @@ def week_markdown(reports: list[GameReport]) -> str:
         prob = max(p.home_win_prob, p.away_win_prob)
         lines.append(
             f"| {p.away_team} @ {p.home_team} | {r.kickoff} | {fav} | {prob:.0%} | "
-            f"{_spread(p.home_team if p.margin >= 0 else p.away_team, p.margin)} | {p.total:.1f} |"
+            f"{_spread(p.home_team if p.margin >= 0 else p.away_team, p.margin)} | {p.total:.1f} | "
+            + "; ".join(
+                x for x in (_missing_short(p, p.away_team), _missing_short(p, p.home_team)) if x
+            )
+            + " |"
         )
     return "\n".join(lines)
 

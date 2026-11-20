@@ -9,9 +9,10 @@ only uses games played before it (no look-ahead):
 2. Points rating per team: exponentially weighted points scored and allowed.
    Gives the expected score of each team, so the projected total.
 
-The final margin blends both; win probability comes from a normal
-distribution of the margin around that projection (NFL margins have a
-standard deviation of roughly 13.5 points).
+The final margin blends both, then subtracts a fixed penalty for each star
+the injury report or roster says will miss the game (see availability.py).
+Win probability comes from a normal distribution of the margin around that
+projection (NFL margins have a standard deviation of roughly 13.5 points).
 """
 
 from __future__ import annotations
@@ -20,6 +21,10 @@ import math
 from dataclasses import dataclass, field
 
 import polars as pl
+
+from nfl_analyst.availability import TeamAvailability
+
+GameAvailability = dict[str, TeamAvailability]
 
 ELO_MEAN = 1505.0
 ELO_K = 20.0
@@ -35,9 +40,26 @@ MARGIN_SD = 13.5
 TOTAL_SD = 13.0
 ELO_WEIGHT = 0.5  # share of the Elo margin in the blended margin (see backtest)
 
+# Points of margin lost per missing star. Fitted by least squares on the
+# model's errors in 2013-2022 and checked on 2023-2025 (see README).
+QB_OUT_PENALTY = 2.0
+OFF_STAR_PENALTY = 1.1
+DEF_STAR_PENALTY = 0.6
+
 
 def normal_cdf(x: float) -> float:
     return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def absence_penalty(team_availability: TeamAvailability | None) -> float:
+    """Points of margin a team loses for its missing stars."""
+    if team_availability is None:
+        return 0.0
+    return (
+        QB_OUT_PENALTY * len(team_availability.missing("QB"))
+        + OFF_STAR_PENALTY * len(team_availability.missing("OFF"))
+        + DEF_STAR_PENALTY * len(team_availability.missing("DEF"))
+    )
 
 
 @dataclass
@@ -60,10 +82,13 @@ class Prediction:
     points_margin: float
     home_points: float
     away_points: float
-    margin: float  # home minus away, blended
+    margin: float  # home minus away, blended, after absence penalties
     total: float
     home_win_prob: float
     elo_home_win_prob: float
+    home_absence_penalty: float = 0.0
+    away_absence_penalty: float = 0.0
+    availability: GameAvailability | None = None
 
     @property
     def away_win_prob(self) -> float:
@@ -105,7 +130,7 @@ class Ratings:
 
     # -- prediction ---------------------------------------------------------
 
-    def predict(self, game: dict) -> Prediction:
+    def predict(self, game: dict, availability: GameAvailability | None = None) -> Prediction:
         self._start_season(int(game["season"]))
         home, away = game["home_team"], game["away_team"]
         neutral = (game.get("location") or "") == "Neutral"
@@ -121,7 +146,15 @@ class Ratings:
         away_points = away_pts.scored + home_pts.allowed - self.league_points - hfa
         points_margin = home_points - away_points
 
-        margin = self.elo_weight * elo_margin + (1 - self.elo_weight) * points_margin
+        availability = availability or {}
+        home_penalty = absence_penalty(availability.get(home))
+        away_penalty = absence_penalty(availability.get(away))
+        margin = (
+            self.elo_weight * elo_margin
+            + (1 - self.elo_weight) * points_margin
+            - home_penalty
+            + away_penalty
+        )
         return Prediction(
             game_id=game["game_id"],
             season=int(game["season"]),
@@ -139,6 +172,9 @@ class Ratings:
             total=home_points + away_points,
             home_win_prob=normal_cdf(margin / MARGIN_SD),
             elo_home_win_prob=elo_prob,
+            home_absence_penalty=home_penalty,
+            away_absence_penalty=away_penalty,
+            availability=availability or None,
         )
 
     # -- update after a game is played ---------------------------------------
@@ -177,23 +213,36 @@ def is_played(game: dict) -> bool:
 
 
 def run_history(
-    games: pl.DataFrame, elo_weight: float = ELO_WEIGHT
+    games: pl.DataFrame,
+    elo_weight: float = ELO_WEIGHT,
+    availability: dict[str, GameAvailability] | None = None,
 ) -> tuple[Ratings, list[tuple[dict, Prediction]]]:
     """Walk through every game in order. Returns final ratings and the
-    pre-game prediction of every played game (walk-forward, no leakage)."""
+    pre-game prediction of every played game (walk-forward, no leakage).
+    `availability` maps game_id to each team's stars (availability.py)."""
+    availability = availability or {}
     ratings = Ratings(elo_weight=elo_weight)
     history: list[tuple[dict, Prediction]] = []
     for game in games.iter_rows(named=True):
         if not is_played(game):
             continue
-        prediction = ratings.predict(game)
+        prediction = ratings.predict(game, availability.get(game["game_id"]))
         history.append((game, prediction))
         ratings.update(game, prediction)
     return ratings, history
 
 
-def predict_upcoming(games: pl.DataFrame, ratings: Ratings) -> list[Prediction]:
-    return [ratings.predict(g) for g in games.iter_rows(named=True) if not is_played(g)]
+def predict_upcoming(
+    games: pl.DataFrame,
+    ratings: Ratings,
+    availability: dict[str, GameAvailability] | None = None,
+) -> list[Prediction]:
+    availability = availability or {}
+    return [
+        ratings.predict(g, availability.get(g["game_id"]))
+        for g in games.iter_rows(named=True)
+        if not is_played(g)
+    ]
 
 
 def evaluate(history: list[tuple[dict, Prediction]], seasons: set[int]) -> dict[str, float]:

@@ -7,8 +7,8 @@ from functools import lru_cache
 
 import polars as pl
 
-from nfl_analyst import model, news
-from nfl_analyst.data import current_season, load_games
+from nfl_analyst import availability, model, news
+from nfl_analyst.data import FIRST_SEASON, current_season, load_games
 from nfl_analyst.teams import TEAM_NAMES, canonical
 
 
@@ -22,11 +22,24 @@ class GameReport:
     summary: str | None = None
 
 
+@dataclass
+class State:
+    games: pl.DataFrame
+    ratings: model.Ratings
+    history: list[tuple[dict, model.Prediction]]
+    availability: dict[str, model.GameAvailability]
+
+
 @lru_cache(maxsize=1)
-def _state() -> tuple[pl.DataFrame, model.Ratings]:
+def _state() -> State:
     games = load_games()
-    ratings, _ = model.run_history(games)
-    return games, ratings
+    seasons = list(range(FIRST_SEASON, current_season() + 1))
+    report, roster = availability.load_absence_sources(seasons)
+    avail = availability.availability_by_game(
+        games, availability.load_player_games(seasons), report, roster
+    )
+    ratings, history = model.run_history(games, availability=avail)
+    return State(games, ratings, history, avail)
 
 
 def refresh() -> None:
@@ -34,7 +47,7 @@ def refresh() -> None:
 
 
 def upcoming_games(week: int | None = None) -> pl.DataFrame:
-    games, _ = _state()
+    games = _state().games
     season = current_season()
     pending = games.filter((pl.col("season") == season) & pl.col("home_score").is_null())
     if pending.is_empty():
@@ -47,10 +60,14 @@ def _kickoff(game: dict) -> str:
     return f"{game['gameday']} {game.get('gametime') or ''} ET".strip()
 
 
+def _predict(game: dict) -> model.Prediction:
+    state = _state()
+    return state.ratings.predict(game, state.availability.get(game["game_id"]))
+
+
 def predict_week(week: int | None = None) -> list[GameReport]:
-    _, ratings = _state()
     return [
-        GameReport(prediction=ratings.predict(g), kickoff=_kickoff(g))
+        GameReport(prediction=_predict(g), kickoff=_kickoff(g))
         for g in upcoming_games(week).iter_rows(named=True)
     ]
 
@@ -58,7 +75,7 @@ def predict_week(week: int | None = None) -> list[GameReport]:
 def find_game(team_a: str, team_b: str) -> dict:
     """Next unplayed game between two teams this season (either home/away)."""
     a, b = canonical(team_a), canonical(team_b)
-    games, _ = _state()
+    games = _state().games
     match = games.filter(
         (pl.col("season") == current_season())
         & pl.col("home_score").is_null()
@@ -76,9 +93,8 @@ def find_game(team_a: str, team_b: str) -> dict:
 
 
 def analyze_game(team_a: str, team_b: str, with_news: bool = True) -> GameReport:
-    _, ratings = _state()
     game = find_game(team_a, team_b)
-    report = GameReport(prediction=ratings.predict(game), kickoff=_kickoff(game))
+    report = GameReport(prediction=_predict(game), kickoff=_kickoff(game))
     if with_news:
         teams = [game["home_team"], game["away_team"]]
         report.injuries = news.injury_report(teams)
@@ -89,7 +105,7 @@ def analyze_game(team_a: str, team_b: str, with_news: bool = True) -> GameReport
 
 
 def ratings_table() -> pl.DataFrame:
-    _, ratings = _state()
+    ratings = _state().ratings
     rows = [
         {
             "team": team,
@@ -105,8 +121,7 @@ def ratings_table() -> pl.DataFrame:
 
 
 def backtest(test_seasons: set[int] | None = None) -> dict[str, float]:
-    games, _ = _state()
-    _, history = model.run_history(games)
+    history = _state().history
     season = current_season()
     test_seasons = test_seasons or {season - 3, season - 2, season - 1}
     return model.evaluate(history, test_seasons)
